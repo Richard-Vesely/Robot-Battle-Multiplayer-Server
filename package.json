@@ -1,0 +1,15 @@
+{
+    "name": "simple-shooter-server",
+    "version": "1.0.0",
+    "description": "Simple multiplayer shooter server",
+    "main": "server.js",
+    "scripts": {
+      "start": "node server.js"
+    },
+    "license": "MIT",
+    "dependencies": {
+      "cors": "^2.8.5",
+      "express": "^4.21.2",
+      "socket.io": "^4.8.1"
+    }
+  }
