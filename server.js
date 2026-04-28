@@ -11,6 +11,7 @@ const FRONTEND_URL = process.env.FRONTEND_URL || "http://127.0.0.1:5500";
 
 const allowedOrigins = [
   FRONTEND_URL,
+  "https://richard-vesely.github.io",
   "http://localhost:5500",
   "http://127.0.0.1:5500",
   "http://localhost:8080",
