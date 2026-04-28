@@ -481,6 +481,7 @@ io.on("connection", (socket) => {
   socket.on("selectRobot", ({ robotId }) => {
     const player = state.players[socket.id];
     if (!player || player.isSpectator) return;
+    if (state.phase === "playing") return;
 
     const robot = robotById(robotId);
     if (!robot) return;
@@ -514,6 +515,7 @@ io.on("connection", (socket) => {
   socket.on("requestRestart", () => {
     const player = state.players[socket.id];
     if (!player || player.isSpectator) return;
+    if (state.phase !== "gameover") return;
 
     const active = getActivePlayers();
     if (active.length < 2) return;
