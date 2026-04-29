@@ -1,3 +1,22 @@
+/*
+  Multiplayer architecture
+  ========================
+
+  - Authoritative server. Clients send only inputs; server simulates physics
+    at 60Hz and broadcasts world state to each room.
+  - Rooms isolate matches. Each room has its own state, players, bullets.
+  - Broadcasts are scoped via Socket.IO rooms (io.to(code).emit).
+  - Inputs are sticky: server keeps last value until next "input" event.
+  - Spawn invulnerability (1s) prevents respawn-instakill.
+  - Forfeit on mid-match disconnect: remaining player wins.
+  - finishGame is idempotent — first slot to KO wins, no overwrite.
+  - In non-"playing" phases the loop does NOT spam state every tick;
+    state is broadcast only when something actually changes (joins, leaves,
+    selectRobot, etc.).
+  - On connect, server emits "config" with robotTypes so client UI is
+    sourced from a single place (server.js).
+*/
+
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
@@ -45,6 +64,7 @@ const io = new Server(server, {
 
 const canvas = { width: 1100, height: 620 };
 const gravity = 900;
+const SPAWN_INVULN_S = 1.0;
 
 const robotTypes = [
   {
@@ -52,60 +72,36 @@ const robotTypes = [
     name: "TANK-X",
     role: "Těžký robot",
     description: "Vydrží hodně zásahů, je pomalejší a dává silnější damage.",
-    maxHp: 160,
-    speed: 185,
-    jumpForce: 390,
-    cooldown: 0.45,
-    bulletSpeed: 480,
-    bulletDamage: 18,
-    bulletCount: 1,
-    spread: 0,
-    bodyColor: "#7cff4d"
+    maxHp: 160, speed: 185, jumpForce: 390,
+    cooldown: 0.45, bulletSpeed: 480, bulletDamage: 18,
+    bulletCount: 1, spread: 0, bodyColor: "#7cff4d"
   },
   {
     id: "scout",
     name: "SCOUT-Z",
     role: "Lehký robot",
     description: "Je rychlý, skáče vysoko, ale má méně životů.",
-    maxHp: 85,
-    speed: 300,
-    jumpForce: 520,
-    cooldown: 0.22,
-    bulletSpeed: 560,
-    bulletDamage: 10,
-    bulletCount: 1,
-    spread: 0,
-    bodyColor: "#00f6ff"
+    maxHp: 85, speed: 300, jumpForce: 520,
+    cooldown: 0.22, bulletSpeed: 560, bulletDamage: 10,
+    bulletCount: 1, spread: 0, bodyColor: "#00f6ff"
   },
   {
     id: "sniper",
     name: "SNIPER-V",
     role: "Dálkový robot",
     description: "Má rychlé projektily a velký zásah, ale střílí pomaleji.",
-    maxHp: 95,
-    speed: 235,
-    jumpForce: 430,
-    cooldown: 0.7,
-    bulletSpeed: 880,
-    bulletDamage: 28,
-    bulletCount: 1,
-    spread: 0,
-    bodyColor: "#b47cff"
+    maxHp: 95, speed: 235, jumpForce: 430,
+    cooldown: 0.7, bulletSpeed: 880, bulletDamage: 28,
+    bulletCount: 1, spread: 0, bodyColor: "#b47cff"
   },
   {
     id: "blaster",
     name: "BLASTER-Q",
     role: "Rozptylový robot",
     description: "Střílí tři projektily najednou a je nebezpečný na blízko.",
-    maxHp: 110,
-    speed: 245,
-    jumpForce: 440,
-    cooldown: 0.52,
-    bulletSpeed: 520,
-    bulletDamage: 9,
-    bulletCount: 3,
-    spread: 0.18,
-    bodyColor: "#ff5bd2"
+    maxHp: 110, speed: 245, jumpForce: 440,
+    cooldown: 0.52, bulletSpeed: 520, bulletDamage: 9,
+    bulletCount: 3, spread: 0.18, bodyColor: "#ff5bd2"
   }
 ];
 
@@ -136,7 +132,6 @@ const platforms = [
 ];
 
 // rooms: Map<code, room>
-// room.players: Map<socketId, player>
 const rooms = new Map();
 
 const ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // no I, O for clarity
@@ -159,16 +154,11 @@ function makeRoom() {
     phase: "waiting", // waiting | selecting | playing | gameover
     players: {},
     bullets: [],
-    winner: null
+    winner: null,
+    tick: 0
   };
   rooms.set(code, room);
   return room;
-}
-
-function deleteRoomIfEmpty(room) {
-  if (Object.keys(room.players).length === 0) {
-    rooms.delete(room.code);
-  }
 }
 
 function robotById(id) {
@@ -210,6 +200,7 @@ function createPlayer(socketId, slot) {
     onGround: false,
     cooldown: 0,
     cooldownTime: 0.3,
+    spawnInvuln: 0,
     hp: 100,
     maxHp: 100,
     speed: 200,
@@ -237,6 +228,7 @@ function resetPlayerForMatch(player) {
   player.dir = player.slot === 1 ? 1 : -1;
   player.onGround = false;
   player.cooldown = 0;
+  player.spawnInvuln = SPAWN_INVULN_S;
 
   player.selectedRobotId = robot.id;
   player.typeId = robot.id;
@@ -271,11 +263,7 @@ function startMatch(room) {
     room.phase = "selecting";
     return;
   }
-
-  for (const player of active) {
-    resetPlayerForMatch(player);
-  }
-
+  for (const player of active) resetPlayerForMatch(player);
   room.bullets = [];
   room.winner = null;
   room.phase = "playing";
@@ -285,6 +273,10 @@ function updatePhaseByOccupancy(room) {
   const active = getActivePlayers(room);
 
   if (active.length < 2) {
+    // If we already finished, keep gameover so the remaining player can read
+    // the winner overlay. They can leave manually.
+    if (room.phase === "gameover") return;
+
     room.phase = "waiting";
     room.winner = null;
     room.bullets = [];
@@ -295,8 +287,8 @@ function updatePhaseByOccupancy(room) {
     return;
   }
 
-  if (room.phase === "waiting" || room.phase === "gameover") {
-    room.phase = bothPlayersReady(room) ? room.phase : "selecting";
+  if (room.phase === "waiting") {
+    room.phase = bothPlayersReady(room) ? "playing" : "selecting";
   }
 }
 
@@ -325,6 +317,7 @@ function spawnBullet(player, angleOffset) {
 
 function updatePlayer(room, player, dt) {
   if (player.hp <= 0) return;
+  if (player.spawnInvuln > 0) player.spawnInvuln = Math.max(0, player.spawnInvuln - dt);
 
   player.vx = 0;
   if (player.input.left) {
@@ -370,6 +363,7 @@ function updatePlayer(room, player, dt) {
     player.vx = 0;
     player.vy = 0;
     player.dir = player.slot === 1 ? 1 : -1;
+    player.spawnInvuln = SPAWN_INVULN_S;
     if (player.hp <= 0) {
       finishGame(room, player.slot === 1 ? 2 : 1);
       return;
@@ -403,7 +397,12 @@ function updateBullets(room, dt) {
     }
 
     const target = getActivePlayers(room).find((p) => p.id !== b.ownerId);
-    if (target && target.hp > 0 && rectsOverlap(b, target)) {
+    if (
+      target &&
+      target.hp > 0 &&
+      (target.spawnInvuln || 0) <= 0 &&
+      rectsOverlap(b, target)
+    ) {
       target.hp = Math.max(0, target.hp - b.damage);
       room.bullets.splice(i, 1);
       if (target.hp <= 0) finishGame(room, target.slot === 1 ? 2 : 1);
@@ -425,6 +424,7 @@ function updateBullets(room, dt) {
 }
 
 function finishGame(room, winnerSlot) {
+  if (room.phase === "gameover") return; // idempotent — first KO wins
   const winnerPlayer = getPlayerBySlot(room, winnerSlot);
   room.phase = "gameover";
   room.winner = {
@@ -433,14 +433,19 @@ function finishGame(room, winnerSlot) {
       ? `${winnerPlayer.name} ovládl arénu.`
       : `Vyhrál Hráč ${winnerSlot}.`
   };
-  // Both players need to confirm rematch — drop ready flags.
-  for (const p of getActivePlayers(room)) p.ready = false;
+  // Clear inputs so a held key doesn't carry into rematch.
+  for (const p of getActivePlayers(room)) {
+    p.ready = false;
+    p.input = { left: false, right: false, jump: false, shoot: false };
+  }
+  room.bullets = [];
 }
 
 function publicState(room) {
   return {
     code: room.code,
     phase: room.phase,
+    tick: room.tick,
     platforms,
     bullets: room.bullets,
     winner: room.winner,
@@ -459,7 +464,8 @@ function publicState(room) {
       name: p.name,
       role: p.role,
       ready: p.ready,
-      selectedRobotId: p.selectedRobotId
+      selectedRobotId: p.selectedRobotId,
+      spawnInvuln: Math.max(0, p.spawnInvuln || 0)
     }))
   };
 }
@@ -476,15 +482,28 @@ function leaveCurrentRoom(socket, reason) {
   socket.leave(code);
   if (!room) return;
 
+  const wasPlayer = !!room.players[socket.id];
+  const wasPlaying = room.phase === "playing";
   delete room.players[socket.id];
-  updatePhaseByOccupancy(room);
 
   if (Object.keys(room.players).length === 0) {
     rooms.delete(code);
     return;
   }
 
-  if (reason) io.to(code).emit("serverMessage", reason);
+  if (wasPlayer && wasPlaying) {
+    // Mid-match disconnect → remaining player wins by forfeit.
+    const remaining = getActivePlayers(room)[0];
+    if (remaining) {
+      finishGame(room, remaining.slot);
+      io.to(code).emit("serverMessage", "Druhý hráč odešel. Vyhráváš zápas.");
+    } else {
+      updatePhaseByOccupancy(room);
+    }
+  } else {
+    updatePhaseByOccupancy(room);
+    if (reason) io.to(code).emit("serverMessage", reason);
+  }
   broadcastState(room);
 }
 
@@ -511,6 +530,13 @@ function joinRoomFlow(socket, room) {
 
 io.on("connection", (socket) => {
   socket.data.roomCode = null;
+
+  // One-shot config so client doesn't need to duplicate robotTypes.
+  socket.emit("config", {
+    robotTypes,
+    canvas,
+    spawnInvulnSeconds: SPAWN_INVULN_S
+  });
 
   socket.on("createRoom", () => {
     if (socket.data.roomCode) leaveCurrentRoom(socket, null);
@@ -602,7 +628,6 @@ io.on("connection", (socket) => {
     if (active.length < 2) return;
     if (!active.every((p) => p.selectedRobotId)) return;
 
-    // Mark this player as ready for rematch; start when both ready.
     player.ready = true;
     if (active.every((p) => p.ready)) {
       startMatch(room);
@@ -630,8 +655,11 @@ setInterval(() => {
       const active = getActivePlayers(room);
       for (const player of active) updatePlayer(room, player, dt);
       updateBullets(room, dt);
+      room.tick++;
+      broadcastState(room);
     }
-    broadcastState(room);
+    // Non-playing phases: no per-tick broadcast — state pushes happen on
+    // events (selectRobot, joinRoom, etc.). Saves bandwidth in the lobby.
   }
 }, 1000 / 60);
 
